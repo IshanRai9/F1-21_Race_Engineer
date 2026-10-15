@@ -9,6 +9,7 @@ Real-time telemetry analysis producing:
 """
 
 import time
+import copy
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -68,6 +69,9 @@ class DeltaTracker:
     current_lap_speeds: list[list[float]] = field(default_factory=list)
     current_lap_num: int = 0
     current_lap_invalid: bool = False
+    recorded_from_start: bool = False
+    last_distance: float | None = None
+    last_elapsed_ms: int = 0
     last_sample_distance: float = -999.0
 
     # Timing
@@ -322,6 +326,20 @@ class AnalysisEngine:
         if lap.current_lap_num != self.delta.current_lap_num:
             self._on_new_lap(lap)
 
+        # A flag anywhere in the lap disqualifies the entire recording.
+        self.delta.current_lap_invalid |= bool(
+            lap.current_lap_invalid or lap.pit_status or lap.driver_status in (0, 2, 3))
+        if self.delta.last_distance is None:
+            self.delta.recorded_from_start = dist <= 100 and elapsed_ms <= 5000
+        else:
+            max_gap = max(100, (self.session.track_length if self.session else 0) * 0.025)
+            if (dist < self.delta.last_distance - 1 or
+                    dist - self.delta.last_distance > max_gap or
+                    elapsed_ms < self.delta.last_elapsed_ms):
+                self.delta.current_lap_invalid = True
+        self.delta.last_distance = dist
+        self.delta.last_elapsed_ms = elapsed_ms
+
         # Sector reporting (Sector 0 -> 1 -> 2)
         if lap.sector != self.last_sector:
             self._on_sector_change(lap)
@@ -364,7 +382,15 @@ class AnalysisEngine:
         self.announced_braking.clear()
 
         # If previous lap completed with valid lap time
-        if prev_lap_num > 0 and lap.last_lap_time_ms > 0 and self.delta.current_lap_times:
+        track_length = self.session.track_length if self.session else 0
+        complete = (
+            prev_lap_num > 0 and lap.current_lap_num == prev_lap_num + 1
+            and self.delta.recorded_from_start and not self.delta.current_lap_invalid
+            and track_length > 0 and self.delta.last_distance is not None
+            and self.delta.last_distance >= track_length - 100
+            and lap.last_lap_time_ms >= self.delta.last_elapsed_ms
+        )
+        if complete and lap.last_lap_time_ms > 0 and self.delta.current_lap_times:
             last_ms = lap.last_lap_time_ms
             secs = last_ms / 1000.0
             mins = int(secs // 60)
@@ -378,7 +404,7 @@ class AnalysisEngine:
                 self.delta.best_lap_speeds = list(self.delta.current_lap_speeds)
                 self.delta.best_lap_time_ms = last_ms
                 self.delta.best_lap_num = prev_lap_num
-                self.best_corner_data = dict(self.current_corner_data)
+                self.best_corner_data = copy.deepcopy(self.current_corner_data)
 
                 self.speak(f"Personal best! {mins} minute {secs_rem:.3f}. New reference lap set.", Priority.HIGH)
             else:
@@ -390,6 +416,10 @@ class AnalysisEngine:
         self.delta.current_lap_speeds.clear()
         self.delta.last_sample_distance = -999.0
         self.delta.current_lap_invalid = False
+        self.delta.recorded_from_start = False
+        self.delta.last_distance = None
+        self.delta.last_elapsed_ms = 0
+        self.delta.last_reported_delta_ms = 0
         self.current_corner_data.clear()
 
     # ──────────────────────────────────────────
@@ -398,10 +428,11 @@ class AnalysisEngine:
 
     def update_telemetry(self, telemetry: CarTelemetryData, lap: LapData):
         """Main update called on each telemetry packet."""
+        # Finalize the previous lap before recording corners from the next one.
+        self.update_delta(lap, telemetry)
         self.analyze_tyres(telemetry, lap)
         self.check_braking_points(lap, telemetry)
         self.update_corners(telemetry, lap)
-        self.update_delta(lap, telemetry)
 
         # Stream snapshot to Web HUD
         update_web_state({
