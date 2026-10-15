@@ -1,5 +1,3 @@
-"""Local lap recordings, separated by track, game session, and driving context."""
-
 import json
 import sqlite3
 import uuid
@@ -64,3 +62,19 @@ class TelemetryHistory:
 
     def close(self):
         self.connection.close()
+
+    def personal_sectors(self, session) -> dict[int, int]:
+        rows = self.connection.execute('''
+            SELECT json_extract(l.recording, '$.sectors')
+            FROM laps l JOIN sessions s USING(capture_id)
+            WHERE s.track_id=? AND s.track_length=? AND s.formula=? AND s.weather_group=?
+              AND l.eligible=1
+        ''', (session.track_id, session.track_length, session.formula,
+              self.weather_group(session.weather)))
+        best = {}
+        for (sectors_json,) in rows:
+            for sector, milliseconds in json.loads(sectors_json or '{}').items():
+                sector = int(sector)
+                if milliseconds > 0:
+                    best[sector] = min(best.get(sector, milliseconds), milliseconds)
+        return best

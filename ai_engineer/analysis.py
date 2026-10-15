@@ -19,6 +19,7 @@ from packets import CarTelemetryData, LapData, SessionData, TRACK_NAMES, SESSION
 from track_data import get_braking_points, get_setup_advice
 from voice_engine import VoiceEngine, Priority
 from history import TelemetryHistory
+from race_radio import RaceRadio
 from web_hud import update_web_state, add_voice_log
 
 
@@ -88,6 +89,7 @@ class AnalysisEngine:
 
     def __init__(self, voice: VoiceEngine, history: TelemetryHistory | None = None):
         self.voice = voice
+        self.radio = RaceRadio(self.speak)
         self.history = history
         self.capture_id: str | None = None
         self.session_uid: int | None = None
@@ -116,16 +118,13 @@ class AnalysisEngine:
         self.previous_corner_sample = None
         self.brake_start_distance = None
 
-        # Load initial track data
-        self.braking_points = []
-
     # ──────────────────────────────────────────
     # Session Handling
     # ──────────────────────────────────────────
 
-    def update_session(self, session: SessionData, session_uid: int | None = None):
+    def update_session(self, session: SessionData, session_uid: int | None = None, player_index=None):
         context = (session_uid, session.track_id, session.track_length, session.formula,
-                   session.session_type, TelemetryHistory.weather_group(session.weather))
+                   session.session_type, TelemetryHistory.weather_group(session.weather), player_index)
         if context != self.session_context:
             self.session_context = context
             self.session_uid = session_uid
@@ -142,6 +141,8 @@ class AnalysisEngine:
             self.last_sector = 0
             self.session_started = False
             self.capture_id = None
+            if hasattr(self.voice, 'clear'):
+                self.voice.clear()
             if self.history and session.track_id >= 0:
                 try:
                     self.capture_id = self.history.start_session(session, session_uid)
@@ -152,15 +153,24 @@ class AnalysisEngine:
                         self.delta.best_lap_times = {float(k): v for k, v in reference['times'].items()}
                         self.delta.best_lap_speeds = reference['speeds']
                         self.best_corner_data = reference['corners']
-                        self.best_sector_times = {int(k): v for k, v in reference['sectors'].items()}
+                        self.best_sector_times = self.history.personal_sectors(session)
                 except (OSError, ValueError, KeyError, sqlite3.Error) as error:
                     print(f'[History] Could not load track history: {error}')
             update_web_state({
                 'connected': False, 'corner_analysis': [], 'voice_log': [],
                 'speed_trace_current': [], 'speed_trace_best': self.delta.best_lap_speeds,
                 'best_lap_time_ms': self.delta.best_lap_time_ms, 'delta_ms': None,
+                'gap_ahead_s': None, 'gap_behind_s': None, 'race_pace_ms': None,
+                'pit_window': None, 'last_update_monotonic': None,
+                'speed': 0, 'gear': 0, 'rpm': 0, 'drs': False, 'throttle': 0, 'brake': 0,
+                'lap_num': 0, 'lap_time_ms': 0, 'last_lap_time_ms': 0, 'position': 0,
+                'tyre_surface_temps': [0] * 4, 'tyre_inner_temps': [0] * 4,
+                'tyre_pressures': [0] * 4, 'engine_temp': 0,
+                'personal_sectors_ms': self.best_sector_times,
             })
+            self.radio.reset(session)
         self.session = session
+        self.radio.session = session
         self.track_id = session.track_id
         self.track_name = TRACK_NAMES.get(session.track_id, f"Track {session.track_id}")
         session_type = SESSION_TYPES.get(session.session_type, "Session")
@@ -182,12 +192,15 @@ class AnalysisEngine:
                 f"Track temperature {session.track_temperature} degrees. "
                 f"Braking points and live delta tracker online. Let's go."
             )
-            self.speak(msg, Priority.CRITICAL)
+            self.speak(msg, Priority.LOW, key='session', ttl=10, cooldown=0)
 
-    def speak(self, message: str, priority: Priority = Priority.NORMAL):
-        """Speak via TTS and record in web HUD radio log."""
-        add_voice_log(message)
-        self.voice.say(message, priority)
+    def speak(self, message: str, priority: Priority = Priority.NORMAL, **options):
+        """Queue speech; the voice worker logs utterances when they actually start."""
+        topic = options.get('key', message)
+        options['key'] = f'{self.capture_id or self.session_context}:{topic}'
+        queued = self.voice.say(message, priority, **options)
+        if not queued and not getattr(self.voice, 'is_running', False):
+            add_voice_log(message, status='muted')
 
     # ──────────────────────────────────────────
     # Tyre Temperature Analysis
@@ -231,7 +244,7 @@ class AnalysisEngine:
             names = " and ".join(w[0] for w in critical_wheels)
             self.speak(
                 f"Critical! {names} overheating at {critical_wheels[0][1]} degrees! Manage your tyres!",
-                Priority.HIGH
+                Priority.CRITICAL, key='tyre_temperature', ttl=5, cooldown=25
             )
             self.tyre_state.last_alert_time = now
         elif hot_wheels:
@@ -267,7 +280,8 @@ class AnalysisEngine:
                 if corner_name not in self.announced_braking:
                     self.announced_braking.add(corner_name)
                     dist_rnd = int(round(approach_dist / 10.0) * 10)
-                    self.speak(f"{message}, {dist_rnd} metres.", Priority.CRITICAL)
+                    self.speak(f"{message}, {dist_rnd} metres.", Priority.CRITICAL,
+                               key='braking', ttl=1.0, cooldown=0)
 
     # ──────────────────────────────────────────
     # Corner Diagnostic Engine ("Why You Are Slower")
@@ -281,7 +295,7 @@ class AnalysisEngine:
         if previous is None or sample[0] <= previous[0]:
             return
         dist, elapsed, speed, brake = sample
-        prev_dist, prev_time, prev_speed, prev_brake = previous
+        prev_dist, prev_time, _, prev_brake = previous
         if brake > 0.3 and prev_brake <= 0.3:
             fraction = (0.3 - prev_brake) / (brake - prev_brake)
             self.brake_start_distance = round(prev_dist + (dist - prev_dist) * fraction)
@@ -386,9 +400,9 @@ class AnalysisEngine:
         if lap.current_lap_num != self.delta.current_lap_num:
             self._on_new_lap(lap)
 
-        # A flag anywhere in the lap disqualifies the entire recording.
         self.delta.current_lap_invalid |= bool(
-            lap.current_lap_invalid or lap.pit_status or lap.driver_status in (0, 2, 3))
+            lap.current_lap_invalid or lap.pit_status or lap.driver_status in (0, 2, 3)
+            or (self.session and self.session.safety_car_status))
         if self.delta.last_distance is None:
             self.delta.recorded_from_start = dist <= 100 and elapsed_ms <= 5000
         else:
@@ -399,9 +413,9 @@ class AnalysisEngine:
                 self.delta.current_lap_invalid = True
         self.delta.last_distance = dist
         self.delta.last_elapsed_ms = elapsed_ms
-        if lap.sector1_time_ms > 0:
+        if lap.sector >= 1 and lap.sector1_time_ms > 0:
             self.current_sector_times[1] = lap.sector1_time_ms
-        if lap.sector2_time_ms > 0:
+        if lap.sector >= 2 and lap.sector2_time_ms > 0:
             self.current_sector_times[2] = lap.sector2_time_ms
 
         # Sector reporting (Sector 0 -> 1 -> 2)
@@ -443,18 +457,20 @@ class AnalysisEngine:
                     self.delta.last_delta_report_time = now
                     delta_s = abs(delta_ms) / 1000.0
                     if delta_ms < -100:
-                        self.speak(f"Minus {delta_s:.1f} seconds to your best. Strong pace.", Priority.LOW)
+                        self.speak(f"Minus {delta_s:.1f} seconds to your best. Strong pace.", Priority.LOW,
+                                   key='live_delta', ttl=6, cooldown=14)
                     elif delta_ms > 150:
-                        self.speak(f"Plus {delta_s:.1f} seconds to your best.", Priority.LOW)
+                        self.speak(f"Plus {delta_s:.1f} seconds to your best.", Priority.LOW,
+                                   key='live_delta', ttl=6, cooldown=14)
 
     def _on_sector_change(self, lap: LapData):
         """Announce sector timing and delta."""
-        if lap.sector == 1 and lap.sector1_time_ms > 0:
-            sec_s = lap.sector1_time_ms / 1000.0
-            self.speak(f"Sector 1: {sec_s:.1f} seconds.", Priority.LOW)
-        elif lap.sector == 2 and lap.sector2_time_ms > 0:
-            sec_s = lap.sector2_time_ms / 1000.0
-            self.speak(f"Sector 2: {sec_s:.1f} seconds.", Priority.LOW)
+        if not self.delta.recorded_from_start or self.delta.current_lap_invalid:
+            return
+        if lap.sector in (1, 2):
+            milliseconds = lap.sector1_time_ms if lap.sector == 1 else lap.sector2_time_ms
+            self.radio.report_sector(lap.current_lap_num, lap.sector, milliseconds,
+                                     self.best_sector_times.get(lap.sector))
 
     def _on_new_lap(self, lap: LapData):
         """Handle lap completion and save best baseline."""
@@ -489,6 +505,9 @@ class AnalysisEngine:
                     print(f'[History] Could not save lap: {error}')
         if complete and lap.last_lap_time_ms > 0 and self.delta.current_lap_times:
             last_ms = lap.last_lap_time_ms
+            self.radio.completed_lap(last_ms, prev_lap_num, sectors, self.best_sector_times)
+            for sector, milliseconds in sectors.items():
+                self.best_sector_times[sector] = min(self.best_sector_times.get(sector, milliseconds), milliseconds)
             secs = last_ms / 1000.0
             mins = int(secs // 60)
             secs_rem = secs % 60
@@ -502,12 +521,13 @@ class AnalysisEngine:
                 self.delta.best_lap_time_ms = last_ms
                 self.delta.best_lap_num = prev_lap_num
                 self.best_corner_data = copy.deepcopy(self.current_corner_data)
-                self.best_sector_times = sectors
 
-                self.speak(f"Personal best! {mins} minute {secs_rem:.3f}. New reference lap set.", Priority.HIGH)
+                self.speak(f"Personal best! {mins} minute {secs_rem:.3f}. New reference lap set.", Priority.TIMING,
+                           key='lap_time', ttl=10, cooldown=0)
             else:
                 diff_s = (last_ms - self.delta.best_lap_time_ms) / 1000.0
-                self.speak(f"Lap complete: {mins} {secs_rem:.3f}. Plus {diff_s:.2f} seconds to your best.", Priority.NORMAL)
+                self.speak(f"Lap complete: {mins} {secs_rem:.3f}. Plus {diff_s:.2f} seconds to your best.", Priority.TIMING,
+                           key='lap_time', ttl=10, cooldown=0)
 
         # Reset current recording lap
         self.delta.current_lap_times.clear()
@@ -530,11 +550,11 @@ class AnalysisEngine:
 
     def update_telemetry(self, telemetry: CarTelemetryData, lap: LapData):
         """Main update called on each telemetry packet."""
-        # Finalize the previous lap before recording corners from the next one.
         self.update_delta(lap, telemetry)
         self.analyze_tyres(telemetry, lap)
         self.check_braking_points(lap, telemetry)
         self.update_corners(telemetry, lap)
+        self.radio.update_strategy(lap)
 
         # Stream snapshot to Web HUD
         update_web_state({
@@ -560,6 +580,11 @@ class AnalysisEngine:
             "delta_ms": self.delta.last_reported_delta_ms,
             "lap_distance": round(lap.lap_distance, 1),
             "sector": lap.sector,
+            'gap_ahead_s': self.radio.gap_ahead_s,
+            'gap_behind_s': self.radio.gap_behind_s,
+            'race_pace_ms': self.radio.race_pace_ms,
+            'pit_window': self.radio.pit_window,
+            'personal_sectors_ms': self.best_sector_times,
             "corner_analysis": self.corner_diagnostics,
             "speed_trace_current": self.delta.current_lap_speeds[-120:],
             "speed_trace_best": self.delta.best_lap_speeds

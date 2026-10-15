@@ -222,6 +222,10 @@ def parse_player_lap_data(data: bytes, player_index: int) -> LapData:
     return parse_lap_data(data, offset)
 
 
+def parse_all_lap_data(data: bytes) -> list[LapData]:
+    return [parse_lap_data(data, HEADER_SIZE + index * LAP_DATA_SIZE) for index in range(22)]
+
+
 # ──────────────────────────────────────────────
 # Packet ID 1: Session Data (partial parse)
 # ──────────────────────────────────────────────
@@ -250,12 +254,26 @@ class SessionData:
     session_type: int
     track_id: int
     formula: int
+    game_paused: int = 0
+    is_spectating: int = 0
+    safety_car_status: int = 0
+    pit_stop_window_ideal_lap: int = 0
+    pit_stop_window_latest_lap: int = 0
+    pit_stop_rejoin_position: int = 0
 
 
 def parse_session_data(data: bytes) -> SessionData:
     """Parse session data (partial — just the fields we need)."""
     values = struct.unpack_from(SESSION_PARTIAL_FORMAT, data, HEADER_SIZE)
-    return SessionData(*values)
+    session = SessionData(*values)
+    # F1 2021 v1 has fixed arrays: 21 marshal zones and 56 weather samples.
+    if len(data) >= 625:
+        session.game_paused = data[HEADER_SIZE + 14]
+        session.is_spectating = data[HEADER_SIZE + 15]
+        session.safety_car_status = data[HEADER_SIZE + 124]
+        (session.pit_stop_window_ideal_lap, session.pit_stop_window_latest_lap,
+         session.pit_stop_rejoin_position) = struct.unpack_from('<BBB', data, HEADER_SIZE + 589)
+    return session
 
 
 # ──────────────────────────────────────────────

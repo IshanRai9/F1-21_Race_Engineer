@@ -79,3 +79,41 @@ class StreamTests(unittest.TestCase):
         self.pair()
         self.assertTrue(web_hud.get_web_state(now=1.5)['connected'])
         self.assertFalse(web_hud.get_web_state(now=4)['connected'])
+
+    def test_telemetry_recovers_after_timeout(self):
+        self.pair()
+        self.stream.check_timeout(now=4)
+        self.assertTrue(self.pair(frame=3, now=4.1))
+        self.assertTrue(web_hud.get_web_state(now=4.2)['connected'])
+
+    def test_flashback_allows_lower_frame_numbers_but_rejects_current_reference_lap(self):
+        self.pair(frame=100, now=1)
+        event = bytearray(build_session_packet(4, 101, 11)[:24])
+        event[5] = 3
+        event.extend(b'FLBK' + struct.pack('<If', 2, 0.08))
+        self.stream.handle(event, now=1.1)
+        self.assertTrue(self.pair(frame=3, now=1.2))
+        self.assertTrue(self.engine.delta.current_lap_invalid)
+
+    def test_paused_game_does_not_feed_race_callouts(self):
+        paused = bytearray(build_session_packet(0.08, 2, 11))
+        paused[38] = 1
+        self.stream.handle(paused, now=1)
+        self.assertFalse(self.pair(frame=3, now=1.1))
+        self.assertFalse(web_hud.get_web_state(now=1.2)['connected'])
+
+    def test_other_car_packet_does_not_poison_player_frame_order(self):
+        packet = header_change(build_telemetry_packet(0.08, 2, 280, 1, 0, 8, 95), player=1)
+        self.assertFalse(self.stream.handle(packet, now=1))
+        self.assertTrue(self.pair(frame=2, now=1.1))
+
+    def test_delayed_pre_flashback_packets_cannot_poison_restored_timeline(self):
+        self.pair(frame=100, now=1)
+        event = bytearray(build_session_packet(4, 101, 11)[:24])
+        event[5] = 3
+        event.extend(b'FLBK' + struct.pack('<If', 2, 0.08))
+        self.stream.handle(event, now=1.1)
+        self.assertFalse(self.pair(frame=100, now=1.15))
+        self.assertTrue(self.pair(frame=3, now=1.2))
+        self.assertFalse(self.pair(frame=100, now=1.25))
+        self.assertTrue(self.pair(frame=4, now=1.3))

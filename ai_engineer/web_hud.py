@@ -66,10 +66,10 @@ def get_web_state(now=None):
         snapshot['data_age_seconds'] = age
         return snapshot
 
-def add_voice_log(message: str):
+def add_voice_log(message: str, status='spoken'):
     with state_lock:
         log = dashboard_state.get("voice_log", [])
-        log.insert(0, {"time": time.strftime("%H:%M:%S"), "message": message})
+        log.insert(0, {"time": time.strftime("%H:%M:%S"), "message": message, 'status': status})
         dashboard_state["voice_log"] = log[:20]
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -265,10 +265,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         <div class="timing-val" id="currentLapTime">0:00.000</div>
                     </div>
                     <div>
-                        <div class="timing-label">Session Best</div>
+                        <div class="timing-label">Track Reference</div>
                         <div class="timing-val" id="bestLapTime" style="color: var(--accent);">--:--.---</div>
                     </div>
                 </div>
+
+                <div style="font-size:12px; color:var(--text-dim); line-height:1.8;" id="raceInfo">Race information awaiting telemetry.</div>
 
                 <div class="delta-box">
                     <div class="timing-label">Performance Delta (vs Best Clean Lap)</div>
@@ -405,7 +407,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     badge.style.color = 'var(--accent)';
                     dot.style.background = 'var(--accent)';
                 } else {
-                    text.innerText = data.data_age_seconds == null ? 'WAITING FOR CAR...' : 'TELEMETRY STALE';
+                    text.innerText = data.paused ? 'GAME PAUSED' : data.spectating ? 'SPECTATING' :
+                        data.data_age_seconds == null ? 'WAITING FOR CAR...' : 'TELEMETRY STALE';
                     badge.style.color = '#e67e22';
                     dot.style.background = '#e67e22';
                 }
@@ -460,6 +463,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 document.getElementById('lapNum').innerText = `P${data.position || 1} | Lap ${data.lap_num || 1}`;
                 document.getElementById('currentLapTime').innerText = formatMS(data.lap_time_ms);
                 document.getElementById('bestLapTime').innerText = formatMS(data.best_lap_time_ms);
+                const gap = value => value == null ? '--' : value.toFixed(1) + 's';
+                const pit = data.pit_window ? 'Laps ' + data.pit_window.join('–') : '--';
+                document.getElementById('raceInfo').innerText =
+                    `Ahead: ${gap(data.gap_ahead_s)} | Behind: ${gap(data.gap_behind_s)} | Pit window: ${pit} | ` +
+                    `Pace (3 clean laps): ${data.race_pace_ms ? formatMS(data.race_pace_ms) : '--'}`;
                 
                 const deltaEl = document.getElementById('deltaVal');
                 const deltaStatus = document.getElementById('deltaStatus');
@@ -486,14 +494,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
                 // Voice Log
                 const vList = document.getElementById('voiceList');
-                if (data.voice_log && data.voice_log.length > 0) {
-                    vList.innerHTML = data.voice_log.map(v => `
+                vList.innerHTML = (data.voice_log || []).map(v => `
                         <div class="voice-item">
-                            <div class="voice-time">${v.time}</div>
+                            <div class="voice-time">${v.time}${v.status === 'muted' ? ' · Voice off' : ''}</div>
                             <div>${v.message}</div>
                         </div>
                     `).join('');
-                }
 
                 // Corner Diagnostics
                 const cList = document.getElementById('cornerList');

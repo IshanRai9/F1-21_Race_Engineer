@@ -40,7 +40,7 @@ from voice_engine import VoiceEngine, Priority
 from analysis import AnalysisEngine
 from history import TelemetryHistory
 from telemetry_stream import TelemetryStream
-from web_hud import start_web_hud_server
+from web_hud import start_web_hud_server, add_voice_log
 import webbrowser
 
 
@@ -152,12 +152,13 @@ def main():
         volume=0.9,
         cooldown_seconds=30.0,
         voice_index=args.voice_index,
+        on_spoken=add_voice_log,
     )
 
     if not args.no_voice:
         voice.start()
         time.sleep(0.5)
-        voice.say_immediate("Engine online. Systems checking out. Waiting for telemetry.")
+        voice.say('Engine online. Waiting for telemetry.', Priority.LOW, key='startup', ttl=10)
     else:
         print("[INFO] Voice output disabled (--no-voice)")
 

@@ -78,6 +78,39 @@ class HistoryTests(unittest.TestCase):
             self.engine.update_session(session, session_uid=200)
             self.assertEqual(self.engine.delta.best_lap_time_ms, 0)
 
+    def test_session_change_clears_previous_track_hud_values(self):
+        import web_hud
+        web_hud.update_web_state({'speed': 280, 'pit_window': [10, 12],
+                                  'lap_time_ms': 80000, 'last_update_monotonic': 1})
+        self.engine.update_session(replace(self.session, track_id=7), session_uid=200)
+        state = web_hud.get_web_state(now=2)
+        self.assertEqual(state['speed'], 0)
+        self.assertEqual(state['lap_time_ms'], 0)
+        self.assertIsNone(state['pit_window'])
+        self.assertIsNone(state['data_age_seconds'])
+
+    def test_personal_sector_records_reload_and_drive_next_session_comparison(self):
+        from history import TelemetryHistory
+        for distance in range(0, 1000, 20):
+            self.engine.update_telemetry(self.telemetry, replace(
+                self.lap, lap_distance=distance, current_lap_time_ms=100 + distance * 50,
+                sector=0 if distance < 300 else 1 if distance < 600 else 2,
+                sector1_time_ms=15000, sector2_time_ms=15000))
+        self.engine.update_telemetry(self.telemetry, replace(
+            self.lap, current_lap_num=2, lap_distance=0, current_lap_time_ms=100, last_lap_time_ms=50000))
+        reopened = TelemetryHistory(self.path)
+        self.addCleanup(reopened.close)
+        voice = SilentVoice()
+        engine = AnalysisEngine(voice, history=reopened)
+        engine.update_session(self.session, session_uid=300)
+        self.assertEqual(engine.best_sector_times, {1: 15000, 2: 15000, 3: 20000})
+        for distance in range(0, 320, 20):
+            engine.update_telemetry(self.telemetry, replace(
+                self.lap, lap_distance=distance, current_lap_time_ms=100 + distance * 50,
+                sector=int(distance >= 300), sector1_time_ms=14800))
+        self.assertTrue(any('faster than your personal best sector' in message[0]
+                            for message in voice.messages))
+
 
 if __name__ == '__main__':
     unittest.main()
