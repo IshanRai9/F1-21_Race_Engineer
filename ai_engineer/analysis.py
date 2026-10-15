@@ -11,6 +11,7 @@ Real-time telemetry analysis producing:
 import time
 import copy
 import sqlite3
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -79,7 +80,7 @@ class DeltaTracker:
 
     # Timing
     last_delta_report_time: float = 0.0
-    last_reported_delta_ms: int = 0
+    last_reported_delta_ms: int | None = None
 
 
 class AnalysisEngine:
@@ -157,7 +158,7 @@ class AnalysisEngine:
             update_web_state({
                 'connected': False, 'corner_analysis': [], 'voice_log': [],
                 'speed_trace_current': [], 'speed_trace_best': self.delta.best_lap_speeds,
-                'best_lap_time_ms': self.delta.best_lap_time_ms, 'delta_ms': 0,
+                'best_lap_time_ms': self.delta.best_lap_time_ms, 'delta_ms': None,
             })
         self.session = session
         self.track_id = session.track_id
@@ -411,7 +412,7 @@ class AnalysisEngine:
         # Sample at regular distance intervals
         if dist - self.delta.last_sample_distance >= DELTA_SAMPLE_INTERVAL:
             self.delta.last_sample_distance = dist
-            key = round(dist / DELTA_SAMPLE_INTERVAL) * DELTA_SAMPLE_INTERVAL
+            key = dist
             self.delta.current_lap_times[key] = elapsed_ms
             self.delta.current_lap_speeds.append([round(dist, 1), telemetry.speed])
             self.delta.current_lap_samples.append({
@@ -423,8 +424,18 @@ class AnalysisEngine:
             })
 
             # Calculate live delta if baseline exists
-            if self.delta.best_lap_times and key in self.delta.best_lap_times:
-                delta_ms = elapsed_ms - self.delta.best_lap_times[key]
+            reference = self.delta.best_lap_times
+            keys = sorted(reference)
+            index = bisect_left(keys, dist)
+            reference_ms = reference.get(dist)
+            if reference_ms is None and 0 < index < len(keys):
+                left, right = keys[index - 1], keys[index]
+                if right - left <= max(100, (self.session.track_length if self.session else 0) * 0.025):
+                    fraction = (dist - left) / (right - left)
+                    reference_ms = reference[left] + fraction * (reference[right] - reference[left])
+            self.delta.last_reported_delta_ms = None
+            if reference_ms is not None:
+                delta_ms = round(elapsed_ms - reference_ms)
                 self.delta.last_reported_delta_ms = delta_ms
 
                 # Voice delta callout periodically
@@ -508,7 +519,7 @@ class AnalysisEngine:
         self.delta.recorded_from_start = False
         self.delta.last_distance = None
         self.delta.last_elapsed_ms = 0
-        self.delta.last_reported_delta_ms = 0
+        self.delta.last_reported_delta_ms = None
         self.current_corner_data.clear()
         self.previous_corner_sample = None
         self.brake_start_distance = None
@@ -528,6 +539,7 @@ class AnalysisEngine:
         # Stream snapshot to Web HUD
         update_web_state({
             "connected": True,
+            "last_update_monotonic": time.monotonic(),
             "track_name": self.track_name,
             "track_id": self.track_id,
             "speed": telemetry.speed,

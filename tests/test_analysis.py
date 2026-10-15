@@ -67,6 +67,16 @@ class LapValidityTests(unittest.TestCase):
         self.finish(lap_num=4)
         self.assertEqual(self.engine.delta.best_lap_time_ms, 0)
 
+    def test_live_delta_interpolates_matching_distance_and_clears_when_unavailable(self):
+        self.engine.delta.best_lap_times = {0.0: 0, 100.0: 1000}
+        self.engine.delta.best_lap_time_ms = 50000
+        self.engine.update_telemetry(self.telemetry, replace(
+            self.lap, lap_distance=50, current_lap_time_ms=600))
+        self.assertEqual(self.engine.delta.last_reported_delta_ms, 100)
+        self.engine.update_telemetry(self.telemetry, replace(
+            self.lap, lap_distance=150, current_lap_time_ms=1600))
+        self.assertIsNone(self.engine.delta.last_reported_delta_ms)
+
 
 if __name__ == '__main__':
     unittest.main()

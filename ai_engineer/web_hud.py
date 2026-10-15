@@ -14,7 +14,10 @@ import socketserver
 import threading
 import json
 import time
+import copy
 from typing import Any
+
+TELEMETRY_TIMEOUT = 2.0
 
 # Shared data store for web client
 dashboard_state: dict[str, Any] = {
@@ -50,7 +53,18 @@ state_lock = threading.Lock()
 
 def update_web_state(data: dict[str, Any]):
     with state_lock:
-        dashboard_state.update(data)
+        dashboard_state.update(copy.deepcopy(data))
+
+
+def get_web_state(now=None):
+    now = time.monotonic() if now is None else now
+    with state_lock:
+        snapshot = copy.deepcopy(dashboard_state)
+        last_update = snapshot.pop('last_update_monotonic', None)
+        age = max(0.0, now - last_update) if last_update is not None else None
+        snapshot['connected'] = bool(snapshot['connected'] and age is not None and age <= TELEMETRY_TIMEOUT)
+        snapshot['data_age_seconds'] = age
+        return snapshot
 
 def add_voice_log(message: str):
     with state_lock:
@@ -387,11 +401,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 const dot = document.getElementById('statusDot');
                 const text = document.getElementById('statusText');
                 if (data.connected) {
-                    text.innerText = 'TELEMETRY LIVE (30Hz)';
+                    text.innerText = 'TELEMETRY LIVE';
                     badge.style.color = 'var(--accent)';
                     dot.style.background = 'var(--accent)';
                 } else {
-                    text.innerText = 'WAITING FOR CAR...';
+                    text.innerText = data.data_age_seconds == null ? 'WAITING FOR CAR...' : 'TELEMETRY STALE';
                     badge.style.color = '#e67e22';
                     dot.style.background = '#e67e22';
                 }
@@ -449,7 +463,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 
                 const deltaEl = document.getElementById('deltaVal');
                 const deltaStatus = document.getElementById('deltaStatus');
-                if (data.delta_ms !== 0 && data.best_lap_time_ms > 0) {
+                if (data.delta_ms != null && data.delta_ms !== 0 && data.best_lap_time_ms > 0) {
                     const sec = Math.abs(data.delta_ms) / 1000;
                     if (data.delta_ms < 0) {
                         deltaEl.className = 'delta-val faster';
@@ -460,14 +474,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         deltaEl.innerText = `+${sec.toFixed(3)}s`;
                         deltaStatus.innerText = 'LOSING TIME TO BEST PACE';
                     }
-                } else if (data.best_lap_time_ms > 0) {
+                } else if (data.delta_ms === 0 && data.best_lap_time_ms > 0) {
                     deltaEl.className = 'delta-val';
                     deltaEl.innerText = '0.000s';
                     deltaStatus.innerText = 'MATCHING BEST PACE';
                 } else {
                     deltaEl.className = 'delta-val';
                     deltaEl.innerText = '---';
-                    deltaStatus.innerText = 'Complete lap to establish delta baseline';
+                    deltaStatus.innerText = data.best_lap_time_ms > 0 ? 'No reference at this distance' : 'Complete lap to establish delta baseline';
                 }
 
                 // Voice Log
@@ -511,6 +525,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 }
             } catch (err) {
                 console.error(err);
+                document.getElementById('statusText').innerText = 'HUD DISCONNECTED';
+                document.getElementById('statusDot').style.background = '#e67e22';
             }
         }
 
@@ -532,8 +548,7 @@ class TelemetryHUDHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            with state_lock:
-                data_copy = json.dumps(dashboard_state)
+            data_copy = json.dumps(get_web_state(), allow_nan=False)
             self.wfile.write(data_copy.encode("utf-8"))
         else:
             self.send_response(404)

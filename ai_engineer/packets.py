@@ -57,7 +57,7 @@ class PacketHeader:
 # Packet ID 6: Car Telemetry Data
 # ──────────────────────────────────────────────
 # Per-car telemetry data block: 60 bytes each
-# 22 cars × 60 bytes + header(24) + footer(1) = 1,347 bytes
+# 22 cars × 60 bytes + header(24) + footer(3) = 1,347 bytes
 CAR_TELEMETRY_FORMAT = (
     "<"
     "H"       # speed (km/h)
