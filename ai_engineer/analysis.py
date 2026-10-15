@@ -112,6 +112,8 @@ class AnalysisEngine:
         self.current_corner_data: dict[str, dict] = {}
         self.best_corner_data: dict[str, dict] = {}
         self.corner_diagnostics: list[dict] = []
+        self.previous_corner_sample = None
+        self.brake_start_distance = None
 
         # Load initial track data
         self.braking_points = []
@@ -131,6 +133,8 @@ class AnalysisEngine:
             self.current_corner_data.clear()
             self.best_corner_data.clear()
             self.corner_diagnostics.clear()
+            self.previous_corner_sample = None
+            self.brake_start_distance = None
             self.current_sector_times.clear()
             self.best_sector_times.clear()
             self.announced_braking.clear()
@@ -269,43 +273,48 @@ class AnalysisEngine:
     # ──────────────────────────────────────────
 
     def update_corners(self, telemetry: CarTelemetryData, lap: LapData):
-        """Track apex speeds, braking points and exit speeds for each corner."""
-        dist = lap.lap_distance
-        speed = telemetry.speed
-        brake = telemetry.brake
+        """Measure matched corner boundaries; never time a partial corner."""
+        sample = (lap.lap_distance, lap.current_lap_time_ms, telemetry.speed, telemetry.brake)
+        previous = self.previous_corner_sample
+        self.previous_corner_sample = sample
+        if previous is None or sample[0] <= previous[0]:
+            return
+        dist, elapsed, speed, brake = sample
+        prev_dist, prev_time, prev_speed, prev_brake = previous
+        if brake > 0.3 and prev_brake <= 0.3:
+            fraction = (0.3 - prev_brake) / (brake - prev_brake)
+            self.brake_start_distance = round(prev_dist + (dist - prev_dist) * fraction)
+        elif brake <= 0.3:
+            self.brake_start_distance = None
+
+        def crossing_time(boundary):
+            return prev_time + (elapsed - prev_time) * (boundary - prev_dist) / (dist - prev_dist)
 
         for c in self.corners:
             c_name = c["name"]
             c_start = c["start"]
             c_end = c["end"]
-
+            if prev_dist <= c_start < dist and c_name not in self.current_corner_data:
+                self.current_corner_data[c_name] = {
+                    'min_speed': speed, 'brake_point': self.brake_start_distance,
+                    'start_time_ms': crossing_time(c_start), 'end_time_ms': None,
+                }
+            data = self.current_corner_data.get(c_name)
+            if data is None or data['end_time_ms'] is not None:
+                continue
             if c_start <= dist <= c_end:
-                if c_name not in self.current_corner_data:
-                    self.current_corner_data[c_name] = {
-                        "min_speed": speed,
-                        "brake_point": None,
-                        "start_time_ms": lap.current_lap_time_ms,
-                        "end_time_ms": None,
-                    }
-
-                data = self.current_corner_data[c_name]
-                if speed < data["min_speed"]:
-                    data["min_speed"] = speed
-
-                if brake > 0.3 and data["brake_point"] is None:
-                    data["brake_point"] = int(dist)
-
-            elif dist > c_end and c_name in self.current_corner_data:
-                data = self.current_corner_data[c_name]
-                if data["end_time_ms"] is None:
-                    data["end_time_ms"] = lap.current_lap_time_ms
-                    self._diagnose_corner(c_name, data, c)
+                data['min_speed'] = min(data['min_speed'], speed)
+                if data['brake_point'] is None and brake > 0.3:
+                    data['brake_point'] = self.brake_start_distance
+            if prev_dist <= c_end < dist:
+                data['end_time_ms'] = crossing_time(c_end)
+                self._diagnose_corner(c_name, data, c)
 
     def _diagnose_corner(self, c_name: str, current_data: dict, ref_def: dict):
         """Diagnose time loss in corner and update HUD."""
         start_t = current_data.get("start_time_ms", 0)
         end_t = current_data.get("end_time_ms", 0)
-        curr_dur = (end_t - start_t) / 1000.0 if end_t and start_t else 0.0
+        curr_dur = (end_t - start_t) / 1000.0
 
         ref_apex = ref_def["ref_apex"]
         ref_brake = ref_def["ref_brake"]
@@ -314,23 +323,26 @@ class AnalysisEngine:
         curr_brake = current_data.get("brake_point", ref_brake)
 
         # Baseline comparison
-        if c_name in self.best_corner_data:
-            best_d = self.best_corner_data[c_name]
+        best_d = self.best_corner_data.get(c_name)
+        if best_d and best_d.get('end_time_ms') is not None:
             best_apex = best_d["min_speed"]
-            best_dur = (best_d["end_time_ms"] - best_d["start_time_ms"]) / 1000.0 if best_d.get("end_time_ms") else curr_dur
+            ref_brake = best_d.get('brake_point')
+            best_dur = (best_d["end_time_ms"] - best_d["start_time_ms"]) / 1000.0
             delta_s = curr_dur - best_dur
+            reference_source = 'recorded lap'
         else:
             best_apex = ref_apex
-            delta_s = max(0.0, (ref_apex - curr_apex) * 0.02)
+            delta_s = None
+            reference_source = 'track guide'
 
         # Diagnosis string
         advice = []
-        if curr_brake and curr_brake < (ref_brake - 20):
+        if curr_brake is not None and ref_brake is not None and curr_brake < (ref_brake - 20):
             diff = ref_brake - curr_brake
-            advice.append(f"Braked {diff}m too early before entry.")
+            advice.append(f"Braked {diff}m before the {reference_source} braking point.")
         if curr_apex < (best_apex - 8):
             diff = best_apex - curr_apex
-            advice.append(f"Apex speed {diff} km/h slower than reference.")
+            advice.append(f"Apex speed {diff} km/h below the {reference_source}.")
         elif curr_apex >= best_apex:
             advice.append("Good apex speed maintained!")
 
@@ -343,9 +355,10 @@ class AnalysisEngine:
         diag_entry = {
             "name": c_name,
             "delta": delta_s,
+            "reference_source": reference_source,
             "current_apex": curr_apex,
             "best_apex": best_apex,
-            "brake_point": curr_brake or "Lift",
+            "brake_point": curr_brake,
             "advice": advice_text,
         }
 
@@ -497,6 +510,8 @@ class AnalysisEngine:
         self.delta.last_elapsed_ms = 0
         self.delta.last_reported_delta_ms = 0
         self.current_corner_data.clear()
+        self.previous_corner_sample = None
+        self.brake_start_distance = None
 
     # ──────────────────────────────────────────
     # Main Update

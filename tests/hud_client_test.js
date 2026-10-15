@@ -35,5 +35,15 @@ vm.runInContext(script, context);
     await vm.runInContext('fetchTelemetry()', context);
     assert.equal(chart.data.datasets[0].data.length, 0);
     assert.equal(chart.data.datasets[1].data[0].x, 100);
+    snapshot = { ...snapshot, corner_analysis: [{name: 'Abbey', delta: null,
+        current_apex: 240, best_apex: 275, brake_point: null,
+        reference_source: 'track guide', advice: 'Guide speed only.'}] };
+    await vm.runInContext('fetchTelemetry()', context);
+    assert.match(element('cornerList').innerHTML, /Guide only/);
+    assert.match(element('cornerList').innerHTML, /Not observed/);
+    assert.doesNotMatch(element('cornerList').innerHTML, /nulls/);
+    snapshot = { ...snapshot, corner_analysis: [] };
+    await vm.runInContext('fetchTelemetry()', context);
+    assert.equal(element('cornerList').innerHTML, '');
     console.log('HUD speed traces retain independent distances and clear previous baselines: PASS');
 })().catch(error => { console.error(error); process.exitCode = 1; });

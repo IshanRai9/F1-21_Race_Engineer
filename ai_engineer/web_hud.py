@@ -293,7 +293,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     <span>Corner Diagnostic: Why You're Slower</span>
                 </div>
                 <div style="font-size:12px; color:var(--text-dim); margin-bottom:12px;">
-                    Real-time corner delta analysis comparing your current lap apex speeds and braking zones to your fastest reference lap.
+                    Measured corner deltas use your recorded reference lap. Track guides provide approximate speed and braking advice only.
                 </div>
                 <div class="corner-list" id="cornerList">
                     <!-- Populated dynamically -->
@@ -483,25 +483,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
                 // Corner Diagnostics
                 const cList = document.getElementById('cornerList');
-                if (data.corner_analysis && data.corner_analysis.length > 0) {
-                    cList.innerHTML = data.corner_analysis.map(c => `
-                        <div class="corner-item ${c.delta > 0.05 ? 'losing' : 'gaining'}">
+                cList.innerHTML = (data.corner_analysis || []).map(c => `
+                        <div class="corner-item ${c.delta == null ? '' : c.delta > 0.05 ? 'losing' : 'gaining'}">
                             <div class="corner-header">
                                 <span>${c.name}</span>
-                                <span style="color: ${c.delta > 0.05 ? 'var(--f1-red)' : 'var(--green)'};">
-                                    ${c.delta > 0 ? '+' : ''}${c.delta.toFixed(3)}s
+                                <span style="color: ${c.delta == null ? 'var(--text-dim)' : c.delta > 0.05 ? 'var(--f1-red)' : 'var(--green)'};">
+                                    ${c.delta == null ? 'Guide only' : (c.delta > 0 ? '+' : '') + c.delta.toFixed(3) + 's'}
                                 </span>
                             </div>
                             <div class="corner-stats">
-                                <span>Apex: ${c.current_apex} km/h (Ref: ${c.best_apex} km/h)</span>
-                                <span>Braking: ${c.brake_point}m</span>
+                                <span>Apex: ${c.current_apex} km/h (Ref: ${c.best_apex} km/h, ${c.reference_source})</span>
+                                <span>Braking: ${c.brake_point == null ? 'Not observed' : c.brake_point + 'm'}</span>
                             </div>
-                            <div class="corner-advice ${c.delta <= 0.05 ? 'good' : ''}">
+                            <div class="corner-advice ${c.delta != null && c.delta <= 0.05 ? 'good' : ''}">
                                 ${c.advice}
                             </div>
                         </div>
                     `).join('');
-                }
 
                 // Speed Trace Chart update
                 if (speedChart) {
