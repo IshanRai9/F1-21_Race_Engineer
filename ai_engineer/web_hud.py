@@ -92,8 +92,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         @keyframes pulse { 0% { opacity: 0.4; } 50% { opacity: 1; } 100% { opacity: 0.4; } }
 
         /* Grid Layout */
-        .grid { display: grid; grid-template-columns: 320px 1fr 340px; gap: 16px; }
-        @media (max-width: 1200px) { .grid { grid-template-columns: 1fr; } }
+        .grid { display: grid; grid-template-columns: 320px minmax(0, 1fr) 340px; gap: 16px; }
+        .grid > div { min-width: 0; }
+        @media (max-width: 1200px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+        @media (max-width: 600px) { header { flex-wrap: wrap; gap: 12px; } .logo { font-size: 16px; } }
 
         .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
         .card-title { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
@@ -311,7 +313,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         // Initialize Chart.js Speed Trace
         const ctx = document.getElementById('speedChart').getContext('2d');
-        const speedChart = new Chart(ctx, {
+        const speedChart = typeof Chart === 'undefined' ? null : new Chart(ctx, {
             type: 'line',
             data: {
                 labels: [],
@@ -340,6 +342,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 animation: false,
                 scales: {
                     x: {
+                        type: 'linear',
+                        min: 0,
                         title: { display: true, text: 'Track Distance (m)', color: '#8b949e' },
                         grid: { color: '#1c212c' },
                         ticks: { color: '#8b949e', maxTicksLimit: 8 }
@@ -500,14 +504,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 }
 
                 // Speed Trace Chart update
-                if (data.speed_trace_best && data.speed_trace_best.length > 0) {
-                    const labels = data.speed_trace_best.map(pt => pt[0]);
-                    const bestSpeeds = data.speed_trace_best.map(pt => pt[1]);
-                    const currentSpeeds = (data.speed_trace_current || []).map(pt => pt[1]);
-                    
-                    speedChart.data.labels = labels;
-                    speedChart.data.datasets[0].data = bestSpeeds;
-                    speedChart.data.datasets[1].data = currentSpeeds;
+                if (speedChart) {
+                    const points = trace => (trace || []).map(([x, y]) => ({ x, y }));
+                    speedChart.data.datasets[0].data = points(data.speed_trace_best);
+                    speedChart.data.datasets[1].data = points(data.speed_trace_current);
+                    speedChart.options.scales.x.max = data.track_length || undefined;
                     speedChart.update('none');
                 }
             } catch (err) {
