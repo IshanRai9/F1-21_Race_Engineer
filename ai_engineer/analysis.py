@@ -10,12 +10,14 @@ Real-time telemetry analysis producing:
 
 import time
 import copy
+import sqlite3
 from dataclasses import dataclass, field
 from typing import Optional
 
 from packets import CarTelemetryData, LapData, SessionData, TRACK_NAMES, SESSION_TYPES
 from track_data import get_braking_points, get_setup_advice
 from voice_engine import VoiceEngine, Priority
+from history import TelemetryHistory
 from web_hud import update_web_state, add_voice_log
 
 
@@ -67,6 +69,7 @@ class DeltaTracker:
     # Current lap
     current_lap_times: dict[float, int] = field(default_factory=dict)
     current_lap_speeds: list[list[float]] = field(default_factory=list)
+    current_lap_samples: list[dict] = field(default_factory=list)
     current_lap_num: int = 0
     current_lap_invalid: bool = False
     recorded_from_start: bool = False
@@ -82,14 +85,20 @@ class DeltaTracker:
 class AnalysisEngine:
     """The brain of the AI Race Engineer."""
 
-    def __init__(self, voice: VoiceEngine):
+    def __init__(self, voice: VoiceEngine, history: TelemetryHistory | None = None):
         self.voice = voice
+        self.history = history
+        self.capture_id: str | None = None
+        self.session_uid: int | None = None
+        self.session_context = None
+        self.best_sector_times: dict[int, int] = {}
+        self.current_sector_times: dict[int, int] = {}
 
         self.tyre_state = TyreState()
         self.delta = DeltaTracker()
         self.session: Optional[SessionData] = None
-        self.track_id: int = 7  # Default to Silverstone
-        self.track_name: str = "Silverstone"
+        self.track_id: int = -1
+        self.track_name: str = "Waiting for session"
         self.braking_points: list[tuple[float, str, str]] = []
         self.announced_braking: set[str] = set()
         self.last_lap_num: int = 0
@@ -99,19 +108,53 @@ class AnalysisEngine:
         self.setup_advice_given = False
 
         # Corner tracking
-        self.corners = SILVERSTONE_CORNERS
+        self.corners = []
         self.current_corner_data: dict[str, dict] = {}
         self.best_corner_data: dict[str, dict] = {}
         self.corner_diagnostics: list[dict] = []
 
         # Load initial track data
-        self.braking_points = get_braking_points(7)
+        self.braking_points = []
 
     # ──────────────────────────────────────────
     # Session Handling
     # ──────────────────────────────────────────
 
-    def update_session(self, session: SessionData):
+    def update_session(self, session: SessionData, session_uid: int | None = None):
+        context = (session_uid, session.track_id, session.track_length, session.formula,
+                   session.session_type, TelemetryHistory.weather_group(session.weather))
+        if context != self.session_context:
+            self.session_context = context
+            self.session_uid = session_uid
+            self.delta = DeltaTracker()
+            self.tyre_state = TyreState()
+            self.current_corner_data.clear()
+            self.best_corner_data.clear()
+            self.corner_diagnostics.clear()
+            self.current_sector_times.clear()
+            self.best_sector_times.clear()
+            self.announced_braking.clear()
+            self.last_sector = 0
+            self.session_started = False
+            self.capture_id = None
+            if self.history and session.track_id >= 0:
+                try:
+                    self.capture_id = self.history.start_session(session, session_uid)
+                    reference = self.history.best_reference(session)
+                    if reference:
+                        self.delta.best_lap_time_ms = reference['lap_time_ms']
+                        self.delta.best_lap_num = reference['lap_num']
+                        self.delta.best_lap_times = {float(k): v for k, v in reference['times'].items()}
+                        self.delta.best_lap_speeds = reference['speeds']
+                        self.best_corner_data = reference['corners']
+                        self.best_sector_times = {int(k): v for k, v in reference['sectors'].items()}
+                except (OSError, ValueError, KeyError, sqlite3.Error) as error:
+                    print(f'[History] Could not load track history: {error}')
+            update_web_state({
+                'connected': False, 'corner_analysis': [], 'voice_log': [],
+                'speed_trace_current': [], 'speed_trace_best': self.delta.best_lap_speeds,
+                'best_lap_time_ms': self.delta.best_lap_time_ms, 'delta_ms': 0,
+            })
         self.session = session
         self.track_id = session.track_id
         self.track_name = TRACK_NAMES.get(session.track_id, f"Track {session.track_id}")
@@ -119,6 +162,9 @@ class AnalysisEngine:
 
         # Load braking points
         self.braking_points = get_braking_points(session.track_id)
+        update_web_state({'track_name': self.track_name, 'track_id': self.track_id,
+                          'track_length': session.track_length, 'session_uid': session_uid,
+                          'capture_id': self.capture_id})
         if session.track_id == 7:
             self.corners = SILVERSTONE_CORNERS
         else:
@@ -339,6 +385,10 @@ class AnalysisEngine:
                 self.delta.current_lap_invalid = True
         self.delta.last_distance = dist
         self.delta.last_elapsed_ms = elapsed_ms
+        if lap.sector1_time_ms > 0:
+            self.current_sector_times[1] = lap.sector1_time_ms
+        if lap.sector2_time_ms > 0:
+            self.current_sector_times[2] = lap.sector2_time_ms
 
         # Sector reporting (Sector 0 -> 1 -> 2)
         if lap.sector != self.last_sector:
@@ -351,6 +401,13 @@ class AnalysisEngine:
             key = round(dist / DELTA_SAMPLE_INTERVAL) * DELTA_SAMPLE_INTERVAL
             self.delta.current_lap_times[key] = elapsed_ms
             self.delta.current_lap_speeds.append([round(dist, 1), telemetry.speed])
+            self.delta.current_lap_samples.append({
+                'distance': dist, 'elapsed_ms': elapsed_ms, 'speed': telemetry.speed,
+                'throttle': telemetry.throttle, 'brake': telemetry.brake, 'gear': telemetry.gear,
+                'rpm': telemetry.engine_rpm, 'tyre_surface_temps': list(telemetry.tyres_surface_temperature),
+                'tyre_inner_temps': list(telemetry.tyres_inner_temperature),
+                'tyre_pressures': list(telemetry.tyres_pressure),
+            })
 
             # Calculate live delta if baseline exists
             if self.delta.best_lap_times and key in self.delta.best_lap_times:
@@ -390,6 +447,22 @@ class AnalysisEngine:
             and self.delta.last_distance >= track_length - 100
             and lap.last_lap_time_ms >= self.delta.last_elapsed_ms
         )
+        sectors = dict(self.current_sector_times)
+        if 1 in sectors and 2 in sectors and lap.last_lap_time_ms > sectors[1] + sectors[2]:
+            sectors[3] = lap.last_lap_time_ms - sectors[1] - sectors[2]
+        if prev_lap_num > 0 and self.delta.current_lap_samples:
+            recording = {
+                'lap_time_ms': lap.last_lap_time_ms, 'lap_num': prev_lap_num,
+                'times': self.delta.current_lap_times, 'speeds': self.delta.current_lap_speeds,
+                'samples': self.delta.current_lap_samples,
+                'corners': self.current_corner_data, 'sectors': sectors,
+            }
+            if self.history and self.capture_id:
+                try:
+                    self.history.record_lap(self.capture_id, prev_lap_num,
+                                            lap.last_lap_time_ms, complete, recording)
+                except (OSError, ValueError, sqlite3.Error) as error:
+                    print(f'[History] Could not save lap: {error}')
         if complete and lap.last_lap_time_ms > 0 and self.delta.current_lap_times:
             last_ms = lap.last_lap_time_ms
             secs = last_ms / 1000.0
@@ -405,6 +478,7 @@ class AnalysisEngine:
                 self.delta.best_lap_time_ms = last_ms
                 self.delta.best_lap_num = prev_lap_num
                 self.best_corner_data = copy.deepcopy(self.current_corner_data)
+                self.best_sector_times = sectors
 
                 self.speak(f"Personal best! {mins} minute {secs_rem:.3f}. New reference lap set.", Priority.HIGH)
             else:
@@ -414,6 +488,8 @@ class AnalysisEngine:
         # Reset current recording lap
         self.delta.current_lap_times.clear()
         self.delta.current_lap_speeds.clear()
+        self.delta.current_lap_samples.clear()
+        self.current_sector_times.clear()
         self.delta.last_sample_distance = -999.0
         self.delta.current_lap_invalid = False
         self.delta.recorded_from_start = False

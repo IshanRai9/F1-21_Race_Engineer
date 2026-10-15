@@ -20,6 +20,7 @@ import sys
 import time
 import argparse
 import os
+from pathlib import Path
 
 # Safe UTF-8 / replacement handling on Windows CMD
 if hasattr(sys.stdout, "reconfigure"):
@@ -41,6 +42,7 @@ from packets import (
 )
 from voice_engine import VoiceEngine, Priority
 from analysis import AnalysisEngine
+from history import TelemetryHistory
 from web_hud import start_web_hud_server
 import webbrowser
 
@@ -142,6 +144,9 @@ def main():
                         help="TTS speech rate in WPM (default: 175)")
     parser.add_argument("--voice-index", type=int, default=0,
                         help="System voice index (default: 0)")
+    parser.add_argument('--history-dir', type=Path,
+                        default=Path(__file__).resolve().parent.parent / 'telemetry-history',
+                        help='Directory for track/session telemetry history')
     args = parser.parse_args()
 
     # ─── Initialize Voice Engine ───
@@ -160,7 +165,8 @@ def main():
         print("[INFO] Voice output disabled (--no-voice)")
 
     # ─── Initialize Analysis Engine ───
-    analysis = AnalysisEngine(voice)
+    history = TelemetryHistory(args.history_dir / 'telemetry.sqlite3')
+    analysis = AnalysisEngine(voice, history=history)
 
     # ─── Set up UDP Socket ───
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -249,7 +255,11 @@ def main():
             if packet_id == 1:
                 try:
                     latest_session = parse_session_data(data)
-                    analysis.update_session(latest_session)
+                    old_context = analysis.session_context
+                    analysis.update_session(latest_session, header.session_uid)
+                    if analysis.session_context != old_context:
+                        latest_telemetry = None
+                        latest_lap = None
                 except Exception as e:
                     if args.debug:
                         print(f"[DEBUG] Session parse error: {e}")
@@ -294,6 +304,7 @@ def main():
         time.sleep(2)
     finally:
         sock.close()
+        history.close()
         voice.shutdown()
         print(f"[INFO] Received {packets_received} packets total.")
         print("[INFO] AI Race Engineer offline.")

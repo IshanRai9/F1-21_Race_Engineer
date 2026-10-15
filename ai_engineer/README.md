@@ -39,6 +39,14 @@ python main.py [--port 20777] [--no-voice] [--debug] [--voice-rate 175] [--voice
 | `--debug` | Show packet parsing errors |
 | `--voice-rate` | Speech speed in WPM (default: 175) |
 | `--voice-index` | Select system voice by index |
+| `--history-dir` | Directory for saved telemetry (default: `telemetry-history` in the project root) |
+
+Completed lap recordings are saved locally in `telemetry-history/telemetry.sqlite3`.
+Each recording belongs to its own track and session capture. Invalid or incomplete
+recordings are archived but excluded from references. Returning to a track loads
+its fastest eligible recorded lap with the same track length, formula, and weather
+category (dry, intermediate, or wet). A new session clears live timing and corner
+state. These are sampled lap recordings, not a lossless archive of raw UDP packets.
 
 ## What It Does
 
